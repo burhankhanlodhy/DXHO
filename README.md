@@ -29,5 +29,5 @@ Choose Options from menu:
 
  1. Add GUI.
  2. Add Option for Automatic Photometry.
- 3. Add Camera Control Function for Raspberrie Pi.
+ 3. Add Camera Control Function for Raspberry Pi.
 
