@@ -17,6 +17,7 @@ Choose Options from menu:
  - If you chose 1 from then write the address of raw file. (.CR2 or
    .NEF)
  - Press Enter.
+ - It will save a converted .FITS file in same folder as of source file.
 
 **Aperture Photometry:**
 
