@@ -1,0 +1,26 @@
+# Digital Exoplanet Hunting Observatory - Database Requirements
+# Install with: pip install -r requirements_database.txt
+
+# Database connectivity (SQLite - built into Python, no additional drivers needed)
+
+# Data handling (if not already installed)
+pandas>=1.5.0
+numpy>=1.21.0
+
+# Existing requirements (add if needed)
+astropy>=5.0
+photutils>=1.6.0
+matplotlib>=3.5.0
+rawpy>=0.18.0
+Pillow>=9.0.0
+exifread>=3.0.0
+requests>=2.28.0
+scipy>=1.9.0
+astroquery>=0.4.6
+
+# Maintenance and scheduling
+schedule>=1.2.0
+
+# Development and testing (optional)
+pytest>=7.0.0
+pytest-cov>=4.0.0
