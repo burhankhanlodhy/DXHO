@@ -20,6 +20,7 @@ from config import APP_CONFIG, FILE_TYPES, DEFAULT_PARAMS
 from photometry import Photometry
 from conversion import Conversion
 from fits_handler import FitsHandler
+from database import ObservatoryDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,11 @@ class MainGUI:
         analysis_menu = tk.Menu(main_menu, tearoff=0)
         main_menu.add_cascade(label="Analysis", menu=analysis_menu)
         analysis_menu.add_command(label="Aperture Photometry", command=self.start_photometry)
+        
+        # Database Menu
+        database_menu = tk.Menu(main_menu, tearoff=0)
+        main_menu.add_cascade(label="Database", menu=database_menu)
+        database_menu.add_command(label="Clear All Database Entries", command=self.clear_database)
         
         # Help Menu
         help_menu = tk.Menu(main_menu, tearoff=0)
@@ -450,12 +456,48 @@ class MainGUI:
                     self._add_info_message(f"Photometry completed: {len(sources)} sources found")
             
             threading.Thread(target=photometry_thread, daemon=True).start()
-            
         except ValueError:
             messagebox.showerror('Invalid Input', 'Please enter valid numeric values for FWHM and threshold.')
         except Exception as e:
             logger.error(f"Error in photometry: {str(e)}")
             messagebox.showerror('Photometry Error', f'Failed to perform photometry: {e}')
+            
+    def clear_database(self):
+        """Clear all entries from the database after user confirmation."""
+        # Show a very explicit warning to the user
+        confirm = messagebox.askyesno(
+            "Confirm Database Deletion",
+            "WARNING: This will permanently delete ALL data from the database, "
+            "including all sessions, sources, and catalog matches.\n\n"
+            "This action cannot be undone.\n\n"
+            "Are you absolutely sure you want to continue?",
+            icon='warning',
+            default=messagebox.NO
+        )
+
+        if confirm:
+            logger.warning("User confirmed database deletion.")
+            try:
+                db = ObservatoryDatabase()
+                if not db.initialize_connection():
+                    messagebox.showerror("Database Error", "Could not connect to the database.")
+                    self._add_info_message("Failed to connect to database for clearing.")
+                    return
+
+                success = db.clear_all_data()
+                db.close()
+
+                if success:
+                    messagebox.showinfo("Database Cleared", "All entries have been successfully removed from the database.")
+                    self._add_info_message("Database has been cleared by user.")
+                else:
+                    messagebox.showerror("Database Error", "An error occurred while clearing the database. Please check the logs for details.")
+                    self._add_info_message("Error occurred while clearing the database.")
+
+            except Exception as e:
+                logger.error(f"Failed to clear database from GUI: {e}", exc_info=True)
+                messagebox.showerror("Database Error", f"A critical error occurred while clearing the database:\n\n{e}")
+                self._add_info_message(f"Critical error during database clearing: {e}")
     
     def _show_progress_window(self, title):
         """Show a progress window for long operations."""

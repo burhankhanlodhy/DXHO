@@ -74,7 +74,7 @@ class Photometry:
         if enable_database:
             try:
                 self.database = ObservatoryDatabase()
-                if not self.database.initialize_connection_pool():
+                if not self.database.initialize_connection():
                     logger.warning("Database connection failed - continuing without database storage")
                     self.database = None
                     self.enable_database = False
