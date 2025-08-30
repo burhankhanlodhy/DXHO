@@ -1,0 +1,16 @@
+{
+  "wsl_workdir": "/home/burhan/my-custom-work",
+  "wsl_config_file": "/home/burhan/astrometry-4211-4216.cfg",
+  "index_file_paths": [],
+  "scale_low": 4.7,
+  "scale_high": 5.3,
+  "scale_units": "degwidth",
+  "downsample": 4,
+  "objs": 120,
+  "depth": "1-120",
+  "uniformize": 10,
+  "nsigma": 12,
+  "code_tolerance": 0.04,
+  "odds_to_solve": "1e6",
+  "cpulimit": 300
+}

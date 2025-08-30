@@ -693,6 +693,11 @@ For technical support, contact the development team.
         main_menu.add_cascade(label="Analysis", menu=self.analysis_menu)
         self.analysis_menu.add_command(label="Aperture Photometry", command=self.photometry, state=tk.DISABLED)
 
+        # Settings Menu
+        self.settings_menu = tk.Menu(main_menu, tearoff=0)
+        main_menu.add_cascade(label="Settings", menu=self.settings_menu)
+        self.settings_menu.add_command(label="WSL Astrometry Settings", command=self.open_wsl_settings)
+
         # Help Menu
         help_menu = tk.Menu(main_menu, tearoff=0)
         main_menu.add_cascade(label="Help", menu=help_menu)
@@ -1151,6 +1156,140 @@ class Fits:
             logger.error(f"Error loading FITS: {str(e)}")
             messagebox.showerror('FITS Error', f'Failed to load FITS file: {e}')
             return None
+
+    def open_wsl_settings(self):
+        """Open WSL Astrometry Settings dialog."""
+        try:
+            from photometry import Photometry
+            
+            # Create settings dialog
+            settings_window = tk.Toplevel(self.root)
+            settings_window.title("WSL Astrometry Settings")
+            settings_window.geometry("600x500")
+            settings_window.resizable(False, False)
+            
+            # Center the window
+            settings_window.update_idletasks()
+            x = (settings_window.winfo_screenwidth() // 2) - (settings_window.winfo_width() // 2)
+            y = (settings_window.winfo_screenheight() // 2) - (settings_window.winfo_height() // 2)
+            settings_window.geometry(f"+{x}+{y}")
+            
+            # Create a temporary photometry instance to access settings
+            temp_photometry = Photometry()
+            current_settings = temp_photometry.get_wsl_settings()
+            
+            # Main frame
+            main_frame = tkk.Frame(settings_window, padding="20")
+            main_frame.pack(fill=tk.BOTH, expand=True)
+            
+            # Title
+            title_label = tk.Label(main_frame, text="WSL Astrometry Configuration", 
+                                  font=('Arial', 14, 'bold'))
+            title_label.pack(pady=(0, 20))
+            
+            # Settings variables
+            workdir_var = tk.StringVar(value=current_settings.get('wsl_workdir', '$HOME/astrometry-work'))
+            config_var = tk.StringVar(value=current_settings.get('wsl_config_file', '/home/burhan/astrometry-4211-4216.cfg'))
+            scale_low_var = tk.DoubleVar(value=current_settings.get('scale_low', 4.5))
+            scale_high_var = tk.DoubleVar(value=current_settings.get('scale_high', 5.5))
+            
+            # Work directory setting
+            work_frame = tkk.LabelFrame(main_frame, text="WSL Work Directory", padding="10")
+            work_frame.pack(fill=tk.X, pady=(0, 15))
+            
+            tk.Label(work_frame, text="Directory path (supports $HOME and ~/):").pack(anchor=tk.W)
+            workdir_entry = tk.Entry(work_frame, textvariable=workdir_var, width=60)
+            workdir_entry.pack(fill=tk.X, pady=(5, 0))
+            
+            # Config file setting
+            config_frame = tkk.LabelFrame(main_frame, text="Astrometry Config File", padding="10")
+            config_frame.pack(fill=tk.X, pady=(0, 15))
+            
+            tk.Label(config_frame, text="Path to astrometry.cfg file:").pack(anchor=tk.W)
+            config_entry = tk.Entry(config_frame, textvariable=config_var, width=60)
+            config_entry.pack(fill=tk.X, pady=(5, 0))
+            
+            # Scale settings
+            scale_frame = tkk.LabelFrame(main_frame, text="Field of View Scale (degrees)", padding="10")
+            scale_frame.pack(fill=tk.X, pady=(0, 20))
+            
+            scale_inner = tk.Frame(scale_frame)
+            scale_inner.pack(fill=tk.X)
+            
+            tk.Label(scale_inner, text="Scale Low:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
+            scale_low_entry = tk.Entry(scale_inner, textvariable=scale_low_var, width=10)
+            scale_low_entry.grid(row=0, column=1, padx=(0, 20))
+            
+            tk.Label(scale_inner, text="Scale High:").grid(row=0, column=2, sticky=tk.W, padx=(0, 10))
+            scale_high_entry = tk.Entry(scale_inner, textvariable=scale_high_var, width=10)
+            scale_high_entry.grid(row=0, column=3)
+            
+            # Status label
+            status_label = tk.Label(main_frame, text="", fg="blue")
+            status_label.pack(pady=(10, 0))
+            
+            # Button frame
+            button_frame = tk.Frame(main_frame)
+            button_frame.pack(fill=tk.X, pady=(20, 0))
+            
+            def save_settings():
+                """Save the settings."""
+                try:
+                    new_settings = {
+                        'wsl_workdir': workdir_var.get().strip(),
+                        'wsl_config_file': config_var.get().strip(),
+                        'scale_low': scale_low_var.get(),
+                        'scale_high': scale_high_var.get(),
+                        'scale_units': 'degwidth'
+                    }
+                    
+                    success = temp_photometry.update_wsl_settings(new_settings)
+                    if success:
+                        status_label.config(text="✓ Settings saved successfully!", fg="green")
+                        settings_window.after(2000, settings_window.destroy)
+                    else:
+                        status_label.config(text="✗ Failed to save settings.", fg="red")
+                        
+                except Exception as e:
+                    logger.error(f"Error saving WSL settings: {e}")
+                    status_label.config(text=f"✗ Error: {str(e)}", fg="red")
+            
+            def test_settings():
+                """Test the current settings."""
+                try:
+                    status_label.config(text="Testing WSL configuration...", fg="blue")
+                    settings_window.update()
+                    
+                    # Create temporary photometry with new settings
+                    test_settings_dict = {
+                        'wsl_workdir': workdir_var.get().strip(),
+                        'wsl_config_file': config_var.get().strip(),
+                        'scale_low': scale_low_var.get(),
+                        'scale_high': scale_high_var.get(),
+                        'scale_units': 'degwidth'
+                    }
+                    
+                    test_photometry = Photometry(use_local_astrometry=True)
+                    test_photometry.update_wsl_settings(test_settings_dict)
+                    
+                    # Run preflight check
+                    if test_photometry._preflight_check_wsl():
+                        status_label.config(text="✓ WSL configuration test passed!", fg="green")
+                    else:
+                        status_label.config(text="✗ WSL configuration test failed.", fg="red")
+                        
+                except Exception as e:
+                    logger.error(f"Error testing WSL settings: {e}")
+                    status_label.config(text=f"✗ Test error: {str(e)}", fg="red")
+            
+            # Buttons
+            tk.Button(button_frame, text="Test Settings", command=test_settings).pack(side=tk.LEFT, padx=(0, 10))
+            tk.Button(button_frame, text="Save", command=save_settings).pack(side=tk.LEFT, padx=(0, 10))
+            tk.Button(button_frame, text="Cancel", command=settings_window.destroy).pack(side=tk.RIGHT)
+            
+        except Exception as e:
+            logger.error(f"Error opening WSL settings dialog: {e}")
+            messagebox.showerror("Settings Error", f"Failed to open settings dialog: {e}")
 
     def mean_fits(self, filepaths):
         """Stack multiple FITS files with enhanced error handling."""

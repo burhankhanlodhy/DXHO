@@ -164,12 +164,28 @@ class CatalogEnhancer:
         return df, missing_simbad, missing_gaia
     
     def query_gaia_astroquery(self, ra: float, dec: float, radius: float) -> Optional[Dict]:
-        """Query Gaia DR3 using astroquery."""
+        """Query Gaia DR3 using optimized ADQL with RUWE and magnitude filtering."""
         try:
             coord = SkyCoord(ra=ra*u.deg, dec=dec*u.deg)
             
-            # Query Gaia DR3
-            results = Gaia.cone_search_async(coord, radius=radius*u.arcsec).get_results()
+            # Optimized ADQL query instead of simple cone search
+            query = f"""
+            SELECT TOP 10
+                source_id, ra, dec, 
+                phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag,
+                bp_rp, parallax, pmra, pmdec, ruwe,
+                DISTANCE(POINT('ICRS', ra, dec), POINT('ICRS', {ra}, {dec})) AS match_distance
+            FROM gaiadr3.gaia_source 
+            WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {ra}, {dec}, {radius/3600.0})) = 1
+                AND phot_g_mean_mag < 19.0
+                AND phot_g_mean_mag IS NOT NULL
+                AND (ruwe IS NULL OR ruwe < 1.4)
+                AND (phot_bp_mean_mag IS NOT NULL AND phot_rp_mean_mag IS NOT NULL)
+            ORDER BY match_distance ASC
+            """
+            
+            job = Gaia.launch_job_async(query)
+            results = job.get_results()
             
             if results is not None and len(results) > 0:
                 # Get the nearest source

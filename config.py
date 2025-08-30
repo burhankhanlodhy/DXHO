@@ -57,9 +57,11 @@ APP_CONFIG = {
 FILE_TYPES = {
     'images': [
         ("PNG files", "*.png"),
-        ("TIFF files", "*.tiff"),
-        ("JPEG files", "*.jpg"),
+        ("TIFF files", "*.tiff;*.tif"),
+        ("JPEG files", "*.jpg;*.jpeg"),
+        ("BMP files", "*.bmp"),
         ("GIF files", "*.gif"),
+        ("All supported images", "*.png;*.tiff;*.tif;*.jpg;*.jpeg;*.bmp;*.gif"),
         ("All files", "*.*")
     ],
     'fits': [
@@ -67,10 +69,16 @@ FILE_TYPES = {
         ("All files", "*.*")
     ],
     'raw': [
-        ("CR2 files", "*.cr2"),
-        ("NEF files", "*.nef"),
-        ("ARW files", "*.arw"),
-        ("DNG files", "*.dng"),
+        ("Canon RAW (CR2/CR3)", "*.cr2;*.cr3"),
+        ("Nikon RAW (NEF)", "*.nef"),
+        ("Sony RAW (ARW)", "*.arw"),
+        ("Adobe DNG", "*.dng"),
+        ("Fujifilm RAW (RAF)", "*.raf"),
+        ("Olympus RAW (ORF)", "*.orf"),
+        ("Panasonic RAW (RW2)", "*.rw2"),
+        ("Pentax RAW (PEF)", "*.pef"),
+        ("Samsung RAW (SRW)", "*.srw"),
+        ("All RAW formats", "*.cr2;*.cr3;*.nef;*.arw;*.dng;*.raf;*.orf;*.rw2;*.pef;*.srw"),
         ("All files", "*.*")
     ],
     'csv': [

@@ -502,47 +502,6 @@ class ObservatoryDatabase:
             logger.error(f"Database maintenance failed: {e}")
             return f"Maintenance failed: {e}"
     
-    def clear_all_data(self) -> bool:
-        """
-        Deletes all data from all tables in the database, respecting foreign keys.
-        This is a destructive operation and cannot be undone.
-        
-        Returns:
-            bool: True if successful, False otherwise.
-        """
-        # Order is important due to foreign key constraints: delete from child tables first.
-        tables_to_clear = [
-            'gaia_matches',
-            'simbad_matches',
-            'photometry_sources',
-            'observatory_sessions'
-        ]
-        
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                logger.warning("CLEARING ALL DATABASE TABLES.")
-                for table in tables_to_clear:
-                    logger.info(f"Deleting all records from {table}...")
-                    cursor.execute(f"DELETE FROM {table};")
-                    
-                    # Reset autoincrement sequence for this table if it exists in sqlite_sequence
-                    try:
-                        cursor.execute(f"DELETE FROM sqlite_sequence WHERE name=?;", (table,))
-                    except sqlite3.Error as seq_e:
-                        logger.debug(f"Could not reset sequence for table {table} (may be normal): {seq_e}")
-
-                logger.info("All database tables have been cleared.")
-                
-                # Optional: Vacuum to shrink the database file
-                self.vacuum_database()
-                return True
-                
-        except Exception as e:
-            logger.error(f"Failed to clear database: {e}", exc_info=True)
-            return False
-
     def close(self):
         """Close database connection."""
         if self.connection:

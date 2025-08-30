@@ -5,6 +5,7 @@ Photometry module for stellar analysis and aperture photometry.
 import numpy as np
 import pandas as pd
 from astropy.io import fits
+import astropy.units as u
 from photutils.detection import DAOStarFinder
 from astropy.stats import mad_std
 import matplotlib.pyplot as plt
@@ -34,27 +35,129 @@ import re
 import random
 from io import BytesIO
 import gzip
+import subprocess
+import uuid
 from database import ObservatoryDatabase, DatabaseConfig
 
 logger = logging.getLogger(__name__)
 
 
+class WSLSettingsManager:
+    """Manages WSL astrometry settings and persistence."""
+    
+    def __init__(self, config_file_path=None):
+        """Initialize settings manager with config file path."""
+        self.config_file = config_file_path or os.path.join(os.path.dirname(__file__), 'wsl_astrometry_config.json')
+        self.default_settings = {
+            'wsl_workdir': '$HOME/astrometry-work',
+            'wsl_config_file': '/home/burhan/astrometry-4211-4216.cfg',
+            'index_file_paths': [],
+            'scale_low': 4.7,
+            'scale_high': 5.3,
+            'scale_units': 'degwidth',
+            'downsample': 4,
+            'objs': 120,
+            'depth': '1-120',
+            'uniformize': 10,
+            'nsigma': 12,
+            'code_tolerance': 0.04,
+            'odds_to_solve': '1e6',
+            'cpulimit': 300
+        }
+        
+    def load_settings(self):
+        """Load settings from config file, return defaults if file doesn't exist."""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    settings = json.load(f)
+                    # Merge with defaults to ensure all keys exist
+                    merged_settings = self.default_settings.copy()
+                    merged_settings.update(settings)
+                    return merged_settings
+        except Exception as e:
+            logger.warning(f"Failed to load WSL settings from {self.config_file}: {e}")
+        
+        return self.default_settings.copy()
+    
+    def save_settings(self, settings):
+        """Save settings to config file."""
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+            
+            with open(self.config_file, 'w') as f:
+                json.dump(settings, f, indent=2)
+            logger.info(f"WSL settings saved to {self.config_file}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save WSL settings to {self.config_file}: {e}")
+            return False
+    
+    def expand_wsl_path(self, wsl_path):
+        """Expand WSL path variables like $HOME and ~/."""
+        if not wsl_path:
+            return None
+            
+        try:
+            # Use WSL to expand the path
+            cmd = ["wsl", "-d", "Ubuntu", "bash", "-c", f"echo '{wsl_path}'"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                expanded_path = result.stdout.strip()
+                return expanded_path
+            else:
+                logger.warning(f"Failed to expand WSL path {wsl_path}: {result.stderr}")
+                return wsl_path
+        except Exception as e:
+            logger.warning(f"Error expanding WSL path {wsl_path}: {e}")
+            return wsl_path
+
+
 class Photometry:
     """
     Class for performing stellar photometry analysis on astronomical images.
+    
+    Uses fallback strategy for astrometry: tries local solve-field first, then Nova API.
+    This provides the best of both worlds - speed of local solving with reliability 
+    of cloud-based solving as backup.
+    
+    Example:
+        # Uses fallback strategy (local first, then Nova)
+        photometry = Photometry()
+        
+        # Force only local solve-field (no fallback)
+        photometry = Photometry(use_local_astrometry=True)
+        photometry.set_astrometry_mode(use_local=True)  # disable fallback
     """
     
-    def __init__(self, gui_reference=None, enable_database=True):
+    def __init__(self, gui_reference=None, enable_database=True, use_local_astrometry=False):
         """
         Initialize the Photometry class.
         
         Args:
             gui_reference: Reference to the GUI instance for progress updates
             enable_database: Whether to enable database storage
+            use_local_astrometry: If False (default), uses fallback strategy (local first, then Nova).
+                                 If True, uses only local solve-field (no fallback to Nova).
         """
         self.gui_ref = gui_reference
         self.astrometry_api_key = "oecnptibpffoyzrl"
         self.astrometry_base_url = "https://nova.astrometry.net/api/"
+        
+        # Local astrometry configuration
+        self.use_local_astrometry = use_local_astrometry
+        
+        # Initialize settings manager and load configuration
+        self.settings_manager = WSLSettingsManager()
+        self.wsl_settings = self.settings_manager.load_settings()
+        
+        # WSL paths will be determined dynamically based on actual user and settings
+        self.wsl_user = None
+        self.wsl_home = None
+        self.wsl_astrometry_path = None
+        self.wsl_config_path = None
+        self.wsl_solve_field_path = None  # Store absolute path to solve-field
         
         # Job tracking for debugging and recovery
         self.last_subid = None
@@ -65,8 +168,14 @@ class Photometry:
         self.api_data_cache = {}
         
         # HTTP session for authentication and connection reuse
-        self.session = requests.Session()
+        self.session = self._setup_robust_session()
         self.current_session_key = None
+        
+        # Initialize WSL environment if using local astrometry
+        if self.use_local_astrometry:
+            if not self._setup_wsl_environment():
+                logger.error("Failed to initialize WSL environment - disabling local astrometry")
+                self.use_local_astrometry = False
         
         # Database integration
         self.enable_database = enable_database
@@ -74,7 +183,7 @@ class Photometry:
         if enable_database:
             try:
                 self.database = ObservatoryDatabase()
-                if not self.database.initialize_connection():
+                if not self.database.initialize_connection_pool():
                     logger.warning("Database connection failed - continuing without database storage")
                     self.database = None
                     self.enable_database = False
@@ -92,6 +201,338 @@ class Photometry:
             logger.warning(f"SIMBAD TAP initialization failed: {e}")
             self.simbad_tap = None
             self.simbad_connection_failures = 0
+    
+    def _setup_robust_session(self):
+        """
+        Setup a simple HTTP session for astrometry.net API.
+        
+        Returns:
+            requests.Session: Configured session object
+        """
+        session = requests.Session()
+        
+        # Keep it simple - just basic session configuration
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (compatible; DEHO Observatory)',
+        })
+        
+        logger.debug("HTTP session configured for astrometry.net API")
+        return session
+    
+    def _preflight_check_wsl(self):
+        """
+        Perform preflight checks for WSL environment before attempting to solve.
+        
+        Returns:
+            bool: True if all checks pass, False otherwise
+        """
+        try:
+            logger.info("Performing WSL preflight checks...")
+            
+            # Check 1: WSL availability
+            wsl_check = subprocess.run(
+                ["wsl", "--status"], 
+                capture_output=True, text=True, timeout=10
+            )
+            if wsl_check.returncode != 0:
+                logger.error("WSL is not available or not running")
+                return False
+            logger.info("✓ WSL is available")
+            
+            # Check 2: Ubuntu distro accessibility
+            ubuntu_check = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "echo", "test"], 
+                capture_output=True, text=True, timeout=10
+            )
+            if ubuntu_check.returncode != 0:
+                logger.error("Ubuntu distro is not accessible")
+                return False
+            logger.info("✓ Ubuntu distro is accessible")
+            
+            # Check 3: Work directory setup and writability
+            if not self.wsl_astrometry_path:
+                # Resolve $HOME and set default if missing
+                home_result = subprocess.run(
+                    ["wsl", "-d", "Ubuntu", "echo", "$HOME"], 
+                    capture_output=True, text=True, timeout=10
+                )
+                if home_result.returncode == 0:
+                    home_dir = home_result.stdout.strip()
+                    self.wsl_astrometry_path = f"{home_dir}/astrometry-work"
+                else:
+                    logger.error("Cannot resolve WSL $HOME directory")
+                    return False
+            
+            # Create directory if it doesn't exist
+            mkdir_result = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "mkdir", "-p", self.wsl_astrometry_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if mkdir_result.returncode != 0:
+                logger.error(f"WSL work directory not writable: {self.wsl_astrometry_path} - mkdir failed")
+                return False
+            
+            # Get current user for ownership
+            user_result = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "whoami"],
+                capture_output=True, text=True, timeout=10
+            )
+            if user_result.returncode == 0:
+                current_user = user_result.stdout.strip()
+                # Set ownership
+                chown_result = subprocess.run(
+                    ["wsl", "-d", "Ubuntu", "chown", f"{current_user}:{current_user}", self.wsl_astrometry_path],
+                    capture_output=True, text=True, timeout=10
+                )
+                if chown_result.returncode != 0:
+                    logger.warning(f"Failed to set ownership on {self.wsl_astrometry_path}")
+            
+            # Set permissions
+            chmod_result = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "chmod", "775", self.wsl_astrometry_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if chmod_result.returncode != 0:
+                logger.warning(f"Failed to set permissions on {self.wsl_astrometry_path}")
+            
+            # Test writability with temp file
+            test_file = f"{self.wsl_astrometry_path}/.test_{uuid.uuid4().hex[:8]}"
+            touch_result = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "touch", test_file],
+                capture_output=True, text=True, timeout=10
+            )
+            if touch_result.returncode != 0:
+                logger.error(f"WSL work directory not writable: {self.wsl_astrometry_path}")
+                return False
+            
+            # Clean up test file
+            subprocess.run(
+                ["wsl", "-d", "Ubuntu", "rm", "-f", test_file],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            logger.info(f"✓ Work directory is writable: {self.wsl_astrometry_path}")
+            
+            # Check 4: solve-field availability
+            solve_check = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "which", "solve-field"],
+                capture_output=True, text=True, timeout=10
+            )
+            if solve_check.returncode != 0:
+                logger.error("solve-field command not found in Ubuntu")
+                return False
+            self.wsl_solve_field_path = solve_check.stdout.strip()
+            logger.info(f"✓ solve-field found at: {self.wsl_solve_field_path}")
+            
+            # Check 5: Config file readability
+            if not self.wsl_config_path:
+                logger.warning("No config path set, using default")
+                return True
+                
+            config_check = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "test", "-r", self.wsl_config_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if config_check.returncode != 0:
+                logger.warning(f"Config file not readable: {self.wsl_config_path} - will use default")
+            else:
+                logger.info(f"✓ Config file readable: {self.wsl_config_path}")
+            
+            logger.info("All WSL preflight checks passed!")
+            return True
+            
+        except subprocess.TimeoutExpired:
+            logger.error("WSL preflight check timeout")
+            return False
+        except Exception as e:
+            logger.error(f"WSL preflight check failed: {e}")
+            return False
+    
+    def _setup_wsl_environment(self):
+        """
+        Setup WSL environment by detecting the actual user and creating work directories.
+        """
+        try:
+            logger.info("Setting up WSL environment for astrometry solving...")
+            
+            # Set Ubuntu as default WSL distro
+            default_result = subprocess.run(
+                ["wsl", "-s", "Ubuntu"], 
+                capture_output=True, text=True, timeout=10
+            )
+            if default_result.returncode == 0:
+                logger.info("✓ Ubuntu set as default WSL distro")
+            else:
+                logger.warning(f"Could not set Ubuntu as default: {default_result.stderr}")
+            
+            # Detect WSL user
+            whoami_result = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "whoami"], 
+                capture_output=True, text=True, timeout=10
+            )
+            if whoami_result.returncode == 0:
+                self.wsl_user = whoami_result.stdout.strip()
+                logger.info(f"Detected WSL user: {self.wsl_user}")
+            else:
+                logger.error("Failed to detect WSL user")
+                return False
+            
+            # Get HOME directory
+            home_result = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "echo", "$HOME"], 
+                capture_output=True, text=True, timeout=10
+            )
+            if home_result.returncode == 0:
+                self.wsl_home = home_result.stdout.strip()
+                logger.info(f"Detected WSL home: {self.wsl_home}")
+            else:
+                logger.error("Failed to detect WSL home directory")
+                return False
+            
+            # Setup work directory from settings or default
+            workdir_setting = self.wsl_settings.get('wsl_workdir', '$HOME/astrometry-work')
+            
+            # If workdir is not set or empty, use default
+            if not workdir_setting:
+                workdir_setting = '$HOME/astrometry-work'
+            
+            # Expand the workdir path (handles $HOME and ~/...)
+            self.wsl_astrometry_path = self.settings_manager.expand_wsl_path(workdir_setting)
+            if not self.wsl_astrometry_path:
+                # Fallback if expansion failed
+                self.wsl_astrometry_path = f"{self.wsl_home}/astrometry-work"
+            
+            logger.info(f"Using WSL work directory: {self.wsl_astrometry_path}")
+            
+            # Look for config in settings or common locations
+            config_setting = self.wsl_settings.get('wsl_config_file')
+            config_paths = []
+            
+            if config_setting:
+                expanded_config = self.settings_manager.expand_wsl_path(config_setting)
+                if expanded_config:
+                    config_paths.append(expanded_config)
+            
+            # Add fallback paths
+            config_paths.extend([
+                f"{self.wsl_home}/astrometry-4211-4216.cfg",
+                "/etc/astrometry.cfg"
+            ])
+            
+            self.wsl_config_path = "/etc/astrometry.cfg"  # fallback
+            for config_path in config_paths:
+                check_config = subprocess.run(
+                    ["wsl", "-d", "Ubuntu", "test", "-f", config_path],
+                    capture_output=True, timeout=5
+                )
+                if check_config.returncode == 0:
+                    self.wsl_config_path = config_path
+                    logger.info(f"Found astrometry config: {config_path}")
+                    break
+            
+            # Create work directory with proper permissions
+            mkdir_result = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "mkdir", "-p", self.wsl_astrometry_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if mkdir_result.returncode != 0:
+                logger.error(f"Failed to create work directory: {mkdir_result.stderr}")
+                return False
+            
+            # Set proper permissions (775) and ownership
+            chmod_result = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "chmod", "775", self.wsl_astrometry_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if chmod_result.returncode != 0:
+                logger.warning(f"Failed to set directory permissions: {chmod_result.stderr}")
+            
+            # Set ownership to current user
+            chown_result = subprocess.run(
+                ["wsl", "-d", "Ubuntu", "chown", f"{self.wsl_user}:{self.wsl_user}", self.wsl_astrometry_path],
+                capture_output=True, text=True, timeout=10
+            )
+            if chown_result.returncode != 0:
+                logger.warning(f"Failed to set directory ownership: {chown_result.stderr}")
+            
+            logger.info(f"✓ Created WSL work directory: {self.wsl_astrometry_path}")
+            
+            # Detect solve-field path during setup
+            try:
+                solve_check = subprocess.run(
+                    ["wsl", "-d", "Ubuntu", "which", "solve-field"],
+                    capture_output=True, text=True, timeout=10
+                )
+                if solve_check.returncode == 0:
+                    self.wsl_solve_field_path = solve_check.stdout.strip()
+                    logger.info(f"✓ solve-field detected at: {self.wsl_solve_field_path}")
+                else:
+                    logger.warning("solve-field not found in PATH during setup")
+                    self.wsl_solve_field_path = "/usr/bin/solve-field"  # fallback
+            except Exception as e:
+                logger.warning(f"Could not detect solve-field path: {e}")
+                self.wsl_solve_field_path = "/usr/bin/solve-field"  # fallback
+            
+            # Update and persist settings with resolved paths
+            self.wsl_settings['wsl_workdir'] = self.wsl_astrometry_path
+            self.wsl_settings['wsl_config_file'] = self.wsl_config_path
+            self.settings_manager.save_settings(self.wsl_settings)
+            
+            return True
+                
+        except Exception as e:
+            logger.error(f"Error setting up WSL environment: {str(e)}")
+            return False
+    
+    def _prepare_fits_for_astrometry(self, filepath):
+        """
+        Prepare FITS file for astrometry.net by creating an optimized version if needed.
+        
+        Args:
+            filepath (str): Original FITS file path
+            
+        Returns:
+            str: Path to astrometry-ready FITS file (may be same as input or new temporary file)
+        """
+        try:
+            # First, validate if current file is already good
+            if self._validate_fits_for_astrometry(filepath):
+                logger.debug("FITS file is already suitable for astrometry.net")
+                return filepath
+            
+            # If validation failed, try to create a better version using our conversion module
+            logger.info("Creating astrometry.net optimized FITS file...")
+            
+            try:
+                from conversion import Conversion
+                converter = Conversion()
+                
+                # Create temporary optimized FITS file
+                import tempfile
+                temp_dir = tempfile.gettempdir()
+                base_name = os.path.splitext(os.path.basename(filepath))[0]
+                optimized_path = os.path.join(temp_dir, f"{base_name}_astrometry_opt.fits")
+                
+                # Use the astrometry-compatible conversion method
+                success = converter.create_astrometry_compatible_fits(filepath, optimized_path)
+                
+                if success and os.path.exists(optimized_path):
+                    logger.info(f"Created optimized FITS file: {optimized_path}")
+                    return optimized_path
+                else:
+                    logger.warning("Failed to create optimized FITS file, using original")
+                    return filepath
+                    
+            except ImportError:
+                logger.warning("Conversion module not available, using original FITS file")
+                return filepath
+            except Exception as e:
+                logger.warning(f"Error creating optimized FITS file: {e}, using original")
+                return filepath
+                
+        except Exception as e:
+            logger.error(f"Error in FITS preparation: {e}")
+            return filepath
     
     def photometry(self, filepath, fwhm, threshold):
         """
@@ -179,8 +620,11 @@ class Photometry:
                 self.gui_ref.progressbar2['value'] = 75
                 self.gui_ref.progressbar2.update()
             
+            # Prepare FITS file for astrometry.net (may create optimized version)
+            astrometry_filepath = self._prepare_fits_for_astrometry(filepath)
+            
             # Perform astrometric calibration and catalog cross-matching
-            wcs_solution, astrometry_data = self._solve_astrometry(filepath, image)
+            wcs_solution, astrometry_data = self._solve_astrometry(astrometry_filepath, image)
             catalog_data = None
             
             # Normalize calibration data for CSV saving
@@ -368,11 +812,11 @@ class Photometry:
                         'pmra': gaia_match.get('pmra', np.nan),
                         'pmdec': gaia_match.get('pmdec', np.nan),
                         
-                        # SIMBAD data  
-                        'simbad_main_id': simbad_match.get('main_id', ''),
+                        # SIMBAD data (using X-Match field names)
+                        'simbad_main_id': simbad_match.get('simbad_main_id', ''),
                         'otype': simbad_match.get('otype', ''),
                         'sp_type': simbad_match.get('sp_type', ''),
-                        'rv_value': simbad_match.get('rv_value', np.nan),
+                        'rv_value': simbad_match.get('rvz_radvel', np.nan),
                         'distance_result': simbad_match.get('distance_result', np.nan),
                     })
                 else:
@@ -624,7 +1068,7 @@ class Photometry:
     
     def _solve_astrometry(self, filepath, image):
         """
-        Solve astrometry using Astrometry.net API.
+        Solve astrometry with fallback strategy: try local solve-field first, then Nova API.
         
         Args:
             filepath: Path to FITS file
@@ -635,10 +1079,62 @@ class Photometry:
         """
         try:
             logger.info("="*60)
-            logger.info("STARTING ASTROMETRIC CALIBRATION WITH ASTROMETRY.NET")
-            logger.info("="*60)
-            logger.info(f"Input file: {filepath}")
-            logger.info(f"File size: {os.path.getsize(filepath)} bytes")
+            
+            if self.use_local_astrometry:
+                # Local-only mode (no fallback)
+                logger.info("STARTING ASTROMETRIC CALIBRATION WITH LOCAL SOLVE-FIELD ONLY")
+                logger.info("="*60)
+                logger.info(f"Input file: {filepath}")
+                logger.info(f"File size: {os.path.getsize(filepath)} bytes")
+                
+                # Enforce preflight check before local solve
+                if not self._preflight_check_wsl():
+                    logger.error("WSL preflight checks failed - local-only mode cannot proceed")
+                    return None, None
+                
+                return self._solve_local_astrometry(filepath, image)
+            else:
+                # Fallback strategy: try local first, then Nova
+                logger.info("STARTING ASTROMETRIC CALIBRATION WITH FALLBACK STRATEGY")
+                logger.info("="*60)
+                logger.info(f"Input file: {filepath}")
+                logger.info(f"File size: {os.path.getsize(filepath)} bytes")
+                
+                # First attempt: Local solve-field
+                logger.info("ATTEMPT 1: Trying local solve-field...")
+                
+                # Enforce preflight check before local solve
+                if not self._preflight_check_wsl():
+                    logger.warning("WSL preflight checks failed - skipping to Nova fallback")
+                    wcs, astrometry_data = None, None
+                else:
+                    wcs, astrometry_data = self._solve_local_astrometry(filepath, image)
+                
+                if wcs is not None and astrometry_data is not None:
+                    logger.info("SUCCESS: Local solve-field completed successfully")
+                    return wcs, astrometry_data
+                
+                # Second attempt: Nova API fallback
+                logger.info("ATTEMPT 2: Local solve-field failed, falling back to Nova API...")
+                return self._solve_nova_astrometry(filepath, image)
+            
+        except Exception as e:
+            logger.error(f"Error in astrometry solving: {str(e)}")
+            return None, None
+    
+    def _solve_nova_astrometry(self, filepath, image):
+        """
+        Solve astrometry using Nova.astrometry.net API.
+        
+        Args:
+            filepath: Path to FITS file
+            image: Image data array
+            
+        Returns:
+            tuple: (WCS solution, astrometry_data dict) or (None, None)
+        """
+        try:
+            logger.info("STARTING ASTROMETRIC CALIBRATION WITH ASTROMETRY.NET API")
             
             # Update progress
             if self.gui_ref and hasattr(self.gui_ref, 'progressbar2'):
@@ -717,7 +1213,7 @@ class Photometry:
             return wcs_solution, calibration_data
             
         except Exception as e:
-            logger.error(f"Error in astrometric calibration: {str(e)}")
+            logger.error(f"Error in Nova astrometric calibration: {str(e)}")
             return None, None
     
     def _astrometry_login(self):
@@ -851,7 +1347,7 @@ class Photometry:
             return None
     
     def _submit_image_for_solving(self, filepath, session_key):
-        """Submit FITS image to Astrometry.net for solving."""
+        """Submit FITS image to Astrometry.net for solving with improved reliability."""
         try:
             submit_url = f"{self.astrometry_base_url}upload"
             
@@ -862,9 +1358,26 @@ class Photometry:
                 
             file_size = os.path.getsize(filepath)
             logger.info(f"Submitting FITS file: {filepath} (size: {file_size} bytes)")
+            
+            # Validate file size (astrometry.net has limits)
+            max_size = 100 * 1024 * 1024  # 100MB limit
+            if file_size > max_size:
+                logger.error(f"File too large: {file_size} bytes (max: {max_size} bytes)")
+                return None
+                
+            # Validate FITS file before upload (warnings only)
+            try:
+                is_valid = self._validate_fits_for_astrometry(filepath)
+                if not is_valid:
+                    logger.warning("FITS file validation failed, but proceeding anyway")
+                else:
+                    logger.debug("FITS file validation passed")
+            except Exception as e:
+                logger.warning(f"FITS validation error (proceeding anyway): {e}")
+                
             logger.debug(f"Submit URL: {submit_url}")
             
-            # Prepare the submission data - only include keys with actual values
+            # Prepare the submission data - keep it simple and minimal like web interface
             submission_data = {
                 "session": session_key,
                 "allow_commercial_use": "d",
@@ -873,23 +1386,26 @@ class Photometry:
                 "scale_units": "degwidth",
                 "scale_type": "ul",
                 "scale_lower": 0.1,
-                "scale_upper": 10,
+                "scale_upper": 10
             }
-            
-            # Only add optional parameters if we have real values
-            # (center_ra, center_dec, radius would be added here if available)
             
             logger.debug(f"Submission data: {submission_data}")
             
-            # Retry logic with exponential backoff
-            max_retries = 3
-            base_delay = 2  # seconds
+            # Retry logic with exponential backoff and rate limiting
+            max_retries = 5  # Increased retries
+            base_delay = 3   # Longer initial delay
             
             for attempt in range(max_retries):
                 try:
+                    # Add rate limiting delay
+                    if attempt > 0:
+                        delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, 2)
+                        logger.info(f"Rate limiting delay: {delay:.1f}s before attempt {attempt + 1}")
+                        time.sleep(delay)
+                        
                     logger.info(f"Upload attempt {attempt + 1}/{max_retries}")
                     
-                    # Prepare the file for upload using multipart form with request-json as file
+                    # Use the proven working format from debug testing
                     with open(filepath, 'rb') as f:
                         files = {
                             'file': (os.path.basename(filepath), f, 'application/fits'),
@@ -897,48 +1413,52 @@ class Photometry:
                         }
                         
                         logger.info("Starting file upload to Astrometry.net...")
-                        response = self.session.post(submit_url, files=files, timeout=600)
+                        response = self.session.post(
+                            submit_url, 
+                            files=files, 
+                            timeout=600  # 10 minutes timeout
+                        )
+                    
+                    logger.debug(f"Upload response status code: {response.status_code}")
+                    logger.debug(f"Upload response headers: {dict(response.headers)}")
+                    logger.debug(f"Upload response text: {response.text}")
+                    
+                    response.raise_for_status()
+                    
+                    result = response.json()
+                    logger.debug(f"Upload result: {result}")
+                    
+                    if result.get('status') == 'success':
+                        subid = result.get('subid')
+                        # Store submission ID immediately
+                        self.last_subid = subid
                         
-                        logger.debug(f"Upload response status code: {response.status_code}")
-                        logger.debug(f"Upload response headers: {dict(response.headers)}")
-                        logger.debug(f"Upload response text: {response.text}")
+                        # Also store any jobs or user_images if already available
+                        if 'jobs' in result and result['jobs']:
+                            self.last_jobid = result['jobs'][0]
+                            logger.info(f"Job ID available immediately: {self.last_jobid}")
                         
-                        response.raise_for_status()
+                        if 'user_images' in result and result['user_images']:
+                            self.last_user_image_id = result['user_images'][0]
+                            logger.info(f"User image ID available immediately: {self.last_user_image_id}")
                         
-                        result = response.json()
-                        logger.debug(f"Upload result: {result}")
+                        logger.info(f"Image submitted successfully, submission ID: {subid}")
+                        return subid
+                    elif result.get('status') == 'error':
+                        error_msg = result.get('errormessage', 'Unknown error')
+                        logger.error(f"API error: {error_msg}")
                         
-                        if result.get('status') == 'success':
-                            subid = result.get('subid')
-                            # Store submission ID immediately
-                            self.last_subid = subid
-                            
-                            # Also store any jobs or user_images if already available
-                            if 'jobs' in result and result['jobs']:
-                                self.last_jobid = result['jobs'][0]
-                                logger.info(f"Job ID available immediately: {self.last_jobid}")
-                            
-                            if 'user_images' in result and result['user_images']:
-                                self.last_user_image_id = result['user_images'][0]
-                                logger.info(f"User image ID available immediately: {self.last_user_image_id}")
-                            
-                            logger.info(f"Image submitted successfully, submission ID: {subid}")
-                            return subid
-                        elif result.get('status') == 'error':
-                            error_msg = result.get('errormessage', 'Unknown error')
-                            logger.error(f"API error: {error_msg}")
-                            
-                            # Don't retry for certain errors
-                            if 'no json' in error_msg.lower() or 'invalid' in error_msg.lower():
-                                logger.error("Non-retryable error, aborting")
-                                return None
-                            
-                            # Retry for other errors
-                            if attempt < max_retries - 1:
-                                delay = base_delay * (2 ** attempt)  # Exponential backoff
-                                logger.warning(f"Retrying in {delay} seconds...")
-                                time.sleep(delay)
-                                continue
+                        # Don't retry for certain errors
+                        if 'no json' in error_msg.lower() or 'invalid' in error_msg.lower():
+                            logger.error("Non-retryable error, aborting")
+                            return None
+                        
+                        # Retry for other errors
+                        if attempt < max_retries - 1:
+                            delay = base_delay * (2 ** attempt)  # Exponential backoff
+                            logger.warning(f"Retrying in {delay} seconds...")
+                            time.sleep(delay)
+                            continue
                         else:
                             logger.error(f"Unexpected response: {result}")
                             if attempt < max_retries - 1:
@@ -970,6 +1490,87 @@ class Photometry:
         except Exception as e:
             logger.error(f"Fatal error during image submission: {str(e)}")
             return None
+    
+    def _validate_fits_for_astrometry(self, filepath):
+        """
+        Validate FITS file for astrometry.net compatibility.
+        
+        Args:
+            filepath (str): Path to FITS file
+            
+        Returns:
+            bool: True if file is valid for astrometry.net
+        """
+        try:
+            logger.debug(f"Validating FITS file for astrometry.net: {filepath}")
+            
+            with fits.open(filepath) as hdul:
+                if len(hdul) == 0:
+                    logger.error("FITS file has no HDUs")
+                    return False
+                    
+                header = hdul[0].header
+                data = hdul[0].data
+                
+                # Check essential headers
+                required_headers = ['SIMPLE', 'BITPIX', 'NAXIS', 'NAXIS1', 'NAXIS2']
+                for req_header in required_headers:
+                    if req_header not in header:
+                        logger.error(f"Missing required header: {req_header}")
+                        return False
+                
+                # Check image dimensions
+                if header['NAXIS'] != 2:
+                    logger.error(f"Image must be 2D, found NAXIS={header['NAXIS']}")
+                    return False
+                    
+                width = header['NAXIS1']
+                height = header['NAXIS2']
+                
+                # Check minimum size (astrometry.net needs sufficient resolution)
+                if width < 100 or height < 100:
+                    logger.error(f"Image too small: {width}x{height} (minimum 100x100)")
+                    return False
+                    
+                # Check maximum size (performance considerations)
+                max_pixels = 8000 * 8000
+                if width * height > max_pixels:
+                    logger.warning(f"Large image: {width}x{height} may take longer to solve")
+                    
+                # Check data type
+                if data is None:
+                    logger.error("FITS file contains no image data")
+                    return False
+                    
+                # Check for reasonable data range
+                if data.size == 0:
+                    logger.error("FITS file contains empty image data")
+                    return False
+                    
+                data_min, data_max = np.nanmin(data), np.nanmax(data)
+                if np.isnan(data_min) or np.isnan(data_max):
+                    logger.error("FITS file contains all NaN values")
+                    return False
+                    
+                if data_min == data_max:
+                    logger.error("FITS file contains constant values (no variation)")
+                    return False
+                    
+                # Check for conflicting WCS headers (can confuse astrometry.net)
+                problematic_wcs = ['CRVAL1', 'CRVAL2', 'CRPIX1', 'CRPIX2', 
+                                 'CD1_1', 'CD1_2', 'CD2_1', 'CD2_2']
+                existing_wcs = [h for h in problematic_wcs if h in header]
+                
+                if existing_wcs:
+                    logger.warning(f"FITS file contains WCS headers that may interfere: {existing_wcs}")
+                    logger.warning("Consider using conversion.py to create a clean FITS file")
+                
+                logger.debug(f"FITS validation passed: {width}x{height}, range: {data_min:.1f} to {data_max:.1f}")
+                return True
+                
+        except Exception as e:
+            logger.error(f"FITS validation error: {str(e)}")
+            return False
     
     def _wait_for_solution(self, submission_id, session_key, max_wait=1200):  # Increased to 20 minutes
         """Wait for astrometry solution to complete with intelligent polling and robust parsing."""
@@ -1776,6 +2377,338 @@ class Photometry:
             logger.error(f"Error during re-authentication: {str(e)}")
             return False
     
+    def _solve_local_astrometry(self, filepath, image):
+        """
+        Solve astrometry using local solve-field command.
+        
+        Args:
+            filepath: Path to FITS file
+            image: Image data array
+            
+        Returns:
+            tuple: (WCS solution, astrometry_data dict) or (None, None)
+        """
+        try:
+            import subprocess
+            import shutil
+            from astropy.wcs import WCS
+            from astropy.io import fits
+            
+            logger.info("="*60)
+            logger.info("STARTING LOCAL ASTROMETRY WITH SOLVE-FIELD")
+            logger.info("="*60)
+            logger.info(f"Input file: {filepath}")
+            
+            # Update progress
+            if self.gui_ref and hasattr(self.gui_ref, 'progressbar2'):
+                self.gui_ref.progressbar2['value'] = 80
+                self.gui_ref.progressbar2.update()
+            
+            # Check WSL environment is setup and perform preflight checks
+            if not self.wsl_astrometry_path:
+                logger.error("WSL environment not properly initialized")
+                return None, None
+            
+            # Perform comprehensive preflight checks
+            if not self._preflight_check_wsl():
+                logger.error("WSL preflight checks failed - skipping to Nova API")
+                return None, None
+            
+            filename = os.path.basename(filepath)
+            wsl_fits_path = f"{self.wsl_astrometry_path}/{filename}"
+            
+            # Convert Windows path to WSL format for copying
+            win_path_for_wsl = filepath.replace("\\", "/").replace("C:", "/mnt/c")
+            
+            # Copy file to WSL work directory (should be writable by current user)
+            copy_cmd = ["wsl", "-d", "Ubuntu", "cp", win_path_for_wsl, wsl_fits_path]
+            logger.info(f"Copying FITS file inside WSL: {win_path_for_wsl} -> {wsl_fits_path}")
+            copy_result = subprocess.run(copy_cmd, capture_output=True, text=True)
+            
+            if copy_result.returncode != 0:
+                logger.error(f"Failed to copy file to WSL: {copy_result.stderr}")
+                return None, None
+            
+            # Set proper permissions on the copied file
+            chmod_cmd = ["wsl", "-d", "Ubuntu", "chmod", "664", wsl_fits_path]
+            chmod_result = subprocess.run(chmod_cmd, capture_output=True, text=True)
+            if chmod_result.returncode != 0:
+                logger.warning(f"Failed to set file permissions: {chmod_result.stderr}")
+            
+            # Validate required fields before constructing command
+            distro = "Ubuntu"
+            solve_binary = self.wsl_solve_field_path or "/usr/bin/solve-field"
+            workdir = self.wsl_astrometry_path
+            input_path = wsl_fits_path
+            config_path = self.wsl_config_path or "/home/burhan/astrometry-4211-4216.cfg"
+            
+            # Using proven working solve-field parameters (hardcoded for reliability)
+            
+            # Log the WSL config path for debugging
+            logger.info("WSL config path (linux): %r", self.wsl_config_path)
+            
+            # Validate all required fields
+            validation_errors = []
+            if not distro:
+                validation_errors.append("WSL distro not specified")
+            if not solve_binary:
+                validation_errors.append("solve-field binary path not found")
+            if not workdir:
+                validation_errors.append("WSL work directory not set")
+            if not input_path:
+                validation_errors.append("Input FITS path not set")
+            if not config_path:
+                validation_errors.append("Astrometry config path not set")
+            
+            if validation_errors:
+                error_msg = "solve-field validation failed: " + ", ".join(validation_errors)
+                logger.error(error_msg)
+                return None, None
+            
+            # Log validated configuration
+            logger.info("solve-field validation passed:")
+            logger.info("  Distro: %s", distro)
+            logger.info("  Binary: %s", solve_binary)
+            logger.info("  Workdir: %s", workdir)
+            logger.info("  Input: %s", input_path)
+            logger.info("  Config: %s", config_path)
+            
+            # Construct solve-field command with validated parameters (using proven working settings)
+            solve_cmd = [
+                "wsl", "-d", distro,            # e.g., "Ubuntu"
+                solve_binary,                   # e.g., "/usr/bin/solve-field"
+                input_path,                     # e.g., "/home/burhan/astrometry-work/v2.fits"
+
+                "--config", config_path,        # e.g., "/home/burhan/astrometry-4211-4216.cfg"
+                "--dir", workdir,               # e.g., "/home/burhan/astrometry-work"
+
+                "--overwrite", "--no-plots", "-v",
+
+                # Matches the working solve:
+                "--scale-units", "degwidth", "--scale-low", "4.7", "--scale-high", "5.3",
+                "--downsample", "4",
+                "--objs", "120",
+                "--depth", "1-120",
+                "--uniformize", "10",
+                "--resort",
+                "--nsigma", "12",
+                "--code-tolerance", "0.04",
+                "--odds-to-solve", "1e6",
+                "--parity", "pos",
+                "--crpix-center",
+                "--cpulimit", "300",
+            ]
+            
+            logger.info(f"Running solve-field command: {' '.join(solve_cmd)}")
+            
+            # Update status
+            if self.gui_ref and hasattr(self.gui_ref, 'statusbar'):
+                self.gui_ref.statusbar.config(text="Local Astrometry: Running solve-field...")
+                self.gui_ref.statusbar.update()
+            
+            # Run solve-field (no Python timeout - solve-field manages its own with --cpulimit)
+            result = subprocess.run(
+                solve_cmd,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode == 0:
+                logger.info("solve-field completed successfully")
+                
+                # Look for the .new file (solved FITS with WCS) in WSL
+                base_name = os.path.splitext(filename)[0]
+                wcs_file_wsl = f"{self.wsl_astrometry_path}/{base_name}.new"
+                
+                # Check if the .new file exists in WSL
+                check_cmd = ["wsl", "-d", "Ubuntu", "test", "-f", wcs_file_wsl]
+                check_result = subprocess.run(check_cmd, capture_output=True)
+                
+                if check_result.returncode == 0:
+                    logger.info(f"Found WCS solution file in WSL: {wcs_file_wsl}")
+                    
+                    # Copy the solved file back to Windows temp directory for processing
+                    temp_dir = os.path.dirname(filepath)
+                    temp_wcs_file = os.path.join(temp_dir, f"{base_name}.new")
+                    
+                    # Convert Windows path for WSL
+                    win_temp_path = temp_wcs_file.replace("\\", "/").replace("C:", "/mnt/c")
+                    copy_back_cmd = ["wsl", "-d", "Ubuntu", "cp", wcs_file_wsl, win_temp_path]
+                    subprocess.run(copy_back_cmd, check=True)
+                    
+                    # Read WCS from solved file
+                    with fits.open(temp_wcs_file) as hdul:
+                        header = hdul[0].header
+                        wcs = WCS(header)
+                        
+                        # Extract astrometry data from header
+                        astrometry_data = self._extract_local_astrometry_data(header)
+                        
+                        logger.info("Local astrometry solution successful!")
+                        logger.info(f"Center RA: {astrometry_data.get('center_ra', 'N/A')}")
+                        logger.info(f"Center Dec: {astrometry_data.get('center_dec', 'N/A')}")
+                        logger.info(f"Pixel scale: {astrometry_data.get('pixscale', 'N/A')} arcsec/pixel")
+                        
+                        # Clean up temp file
+                        try:
+                            os.remove(temp_wcs_file)
+                        except:
+                            pass
+                        
+                        # Update progress
+                        if self.gui_ref and hasattr(self.gui_ref, 'progressbar2'):
+                            self.gui_ref.progressbar2['value'] = 95
+                            self.gui_ref.progressbar2.update()
+                        
+                        # Update status
+                        if self.gui_ref and hasattr(self.gui_ref, 'statusbar'):
+                            self.gui_ref.statusbar.config(text="Local Astrometry: Complete")
+                            self.gui_ref.statusbar.update()
+                        
+                        return wcs, astrometry_data
+                else:
+                    logger.error("solve-field completed but no .new file found")
+            else:
+                logger.error(f"solve-field failed with return code: {result.returncode}")
+                logger.error(f"stdout: {result.stdout}")
+                logger.error(f"stderr: {result.stderr}")
+            
+            return None, None
+            
+        except Exception as e:
+            logger.error(f"Error in local astrometry: {str(e)}")
+            return None, None
+    
+    def _extract_local_astrometry_data(self, header):
+        """
+        Extract astrometry data from a FITS header solved by solve-field.
+        
+        Args:
+            header: FITS header from solved file
+            
+        Returns:
+            dict: Normalized astrometry data
+        """
+        try:
+            astrometry_data = {}
+            
+            # Center coordinates
+            if 'CRVAL1' in header and 'CRVAL2' in header:
+                astrometry_data['center_ra'] = float(header['CRVAL1'])
+                astrometry_data['center_dec'] = float(header['CRVAL2'])
+            
+            # Pixel scale (convert from degrees to arcseconds)
+            if 'CD1_1' in header and 'CD2_2' in header:
+                cd1_1 = abs(float(header['CD1_1']))
+                cd2_2 = abs(float(header['CD2_2']))
+                pixscale = (cd1_1 + cd2_2) / 2.0 * 3600.0  # degrees to arcsec
+                astrometry_data['pixscale'] = pixscale
+            
+            # Field dimensions
+            if 'NAXIS1' in header and 'NAXIS2' in header and 'pixscale' in astrometry_data:
+                width_pixels = int(header['NAXIS1'])
+                height_pixels = int(header['NAXIS2'])
+                pixscale = astrometry_data['pixscale']
+                
+                field_width_arcmin = (width_pixels * pixscale) / 60.0
+                field_height_arcmin = (height_pixels * pixscale) / 60.0
+                
+                astrometry_data['field_width_arcmin'] = field_width_arcmin
+                astrometry_data['field_height_arcmin'] = field_height_arcmin
+            
+            # Orientation and parity (if available)
+            if 'CD1_2' in header and 'CD2_1' in header and 'CD1_1' in header and 'CD2_2' in header:
+                cd1_1 = abs(float(header['CD1_1']))
+                cd1_2 = float(header['CD1_2'])
+                cd2_1 = float(header['CD2_1'])
+                cd2_2 = abs(float(header['CD2_2']))
+                orientation = np.degrees(np.arctan2(cd1_2, cd2_1))
+                astrometry_data['orientation'] = orientation
+                
+                # Parity (sign of determinant)
+                det = cd1_1 * cd2_2 - cd1_2 * cd2_1
+                astrometry_data['parity'] = 1 if det > 0 else -1
+            
+            # Add metadata
+            astrometry_data['has_wcs'] = True
+            astrometry_data['has_astrometry'] = True
+            astrometry_data['solver'] = 'local_solve_field'
+            
+            logger.info("Successfully extracted local astrometry data")
+            return astrometry_data
+            
+        except Exception as e:
+            logger.error(f"Error extracting local astrometry data: {str(e)}")
+            return {'has_wcs': False, 'has_astrometry': False, 'solver': 'local_solve_field'}
+    
+    def set_astrometry_mode(self, use_local=True):
+        """
+        Set the astrometry solving mode.
+        
+        Args:
+            use_local (bool): If True, use ONLY local solve-field (no fallback).
+                            If False, use fallback strategy (local first, then Nova API).
+        """
+        self.use_local_astrometry = use_local
+        mode = "local solve-field only (no fallback)" if use_local else "fallback strategy (local first, then Nova API)"
+        logger.info(f"Astrometry mode set to: {mode}")
+    
+    def get_astrometry_mode(self):
+        """
+        Get the current astrometry solving mode.
+        
+        Returns:
+            str: Current astrometry mode description
+        """
+        return "local solve-field only (no fallback)" if self.use_local_astrometry else "fallback strategy (local first, then Nova API)"
+    
+    def update_wsl_settings(self, new_settings):
+        """
+        Update WSL settings and save to config file.
+        
+        Args:
+            new_settings (dict): Dictionary containing new settings to update
+            
+        Returns:
+            bool: True if settings were successfully updated and saved
+        """
+        try:
+            # Update settings
+            self.wsl_settings.update(new_settings)
+            
+            # Expand paths if needed
+            if 'wsl_workdir' in new_settings:
+                expanded_workdir = self.settings_manager.expand_wsl_path(new_settings['wsl_workdir'])
+                if expanded_workdir:
+                    self.wsl_astrometry_path = expanded_workdir
+                    self.wsl_settings['wsl_workdir'] = expanded_workdir
+            
+            if 'wsl_config_file' in new_settings:
+                expanded_config = self.settings_manager.expand_wsl_path(new_settings['wsl_config_file'])
+                if expanded_config:
+                    self.wsl_config_path = expanded_config
+                    self.wsl_settings['wsl_config_file'] = expanded_config
+            
+            # Save settings
+            success = self.settings_manager.save_settings(self.wsl_settings)
+            if success:
+                logger.info("WSL settings updated successfully")
+            
+            return success
+            
+        except Exception as e:
+            logger.error(f"Failed to update WSL settings: {e}")
+            return False
+    
+    def get_wsl_settings(self):
+        """
+        Get current WSL settings.
+        
+        Returns:
+            dict: Current WSL settings
+        """
+        return self.wsl_settings.copy()
+    
     
     def _normalize_calibration_data(self, calibration_data):
         """Normalize calibration data keys for CSV saving."""
@@ -1865,59 +2798,40 @@ class Photometry:
                 self.gui_ref.progressbar2['value'] = 85
                 self.gui_ref.progressbar2.update()
             
-            # STEP 1: Query Gaia for the entire field first
-            gaia_catalog = self._query_gaia_field(center_ra, center_dec, search_radius)
-            logger.info(f"Retrieved {len(gaia_catalog) if gaia_catalog is not None else 0} Gaia sources")
+            # STEP 1: Optimized Gaia query (single async CIRCLE with RUWE/magnitude filtering)
+            gaia_matches_dict = self._query_gaia_optimized(sky_coords, field_radius_deg=search_radius)
+            logger.info(f"Optimized Gaia matching: {len(gaia_matches_dict)}/{len(sky_coords)} sources matched")
+            
+            # Convert optimized matches to the expected format
+            gaia_matches = []
+            for i in range(len(sky_coords)):
+                if i in gaia_matches_dict:
+                    gaia_matches.append(gaia_matches_dict[i])
+                else:
+                    # Empty match for unmatched sources
+                    gaia_matches.append({
+                        'gaia_source_id': '',
+                        'gaia_ra': np.nan,
+                        'gaia_dec': np.nan,
+                        'phot_g_mean_mag': np.nan,
+                        'phot_bp_mean_mag': np.nan,
+                        'phot_rp_mean_mag': np.nan,
+                        'bp_rp': np.nan,
+                        'parallax': np.nan,
+                        'pmra': np.nan,
+                        'pmdec': np.nan,
+                        'ruwe': np.nan,
+                        'match_distance_arcsec': np.nan
+                    })
             
             # Update progress
             if self.gui_ref and hasattr(self.gui_ref, 'progressbar2'):
                 self.gui_ref.progressbar2['value'] = 90
                 self.gui_ref.progressbar2.update()
             
-            # Perform nearest-neighbor matching for Gaia
-            gaia_matches = self._nearest_neighbor_match(sky_coords, gaia_catalog, 'gaia')
-            
-            # STEP 2: Query SIMBAD individually for each source using enhanced TAP queries
-            logger.info(f"Querying SIMBAD individually for {len(sky_coords)} sources with enhanced connection management...")
-            simbad_matches = []
-            
-            for i, coord in enumerate(sky_coords):
-                ra = coord.ra.degree  
-                dec = coord.dec.degree
-                
-                # Progress reporting every 10 sources
-                if i % 10 == 0 and i > 0:
-                    logger.info(f"SIMBAD query progress: {i}/{len(sky_coords)} sources completed")
-                    
-                # Query SIMBAD using enhanced TAP for this specific coordinate
-                simbad_match = self._query_simbad_tap(ra, dec, radius_arcsec=5.0)
-                simbad_matches.append(simbad_match)
-                
-                # Enhanced rate limiting with jitter (target ~0.3 QPS = ~3.3s between requests)
-                if i < len(sky_coords) - 1:
-                    
-                    # Base delay 2-3s with jitter to target ~0.3 QPS overall
-                    base_delay = 2.5  # Base delay increased to 2.5s
-                    jitter = random.uniform(-0.5, 0.5)  # ±0.5s jitter
-                    delay_with_jitter = base_delay + jitter  # Results in 2-3s range
-                    
-                    # Adaptive delay based on recent connection failures
-                    if hasattr(self, 'simbad_connection_failures') and self.simbad_connection_failures > 0:
-                        # Increase delay if we've had recent connection issues
-                        adaptive_factor = 1 + (self.simbad_connection_failures * 0.4)  # 0.4s per recent failure
-                        adaptive_delay = delay_with_jitter * adaptive_factor
-                        logger.debug(f"Using adaptive delay with jitter: {adaptive_delay:.1f}s (failures: {self.simbad_connection_failures})")
-                        time.sleep(adaptive_delay)
-                    else:
-                        logger.debug(f"Using base delay with jitter: {delay_with_jitter:.1f}s")
-                        time.sleep(delay_with_jitter)
-                        
-            # Reset connection failure counter after successful batch
-            if hasattr(self, 'simbad_connection_failures'):
-                successful_queries = len([m for m in simbad_matches if m['main_id']])
-                if successful_queries > len(simbad_matches) * 0.8:  # >80% success rate
-                    logger.info(f"Good SIMBAD success rate ({successful_queries}/{len(simbad_matches)}), resetting failure counter")
-                    self.simbad_connection_failures = 0
+            # STEP 2: Query SIMBAD using efficient X-Match approach
+            logger.info(f"Performing SIMBAD X-Match for {len(sky_coords)} sources...")
+            simbad_matches = self._simbad_xmatch(sky_coords)
             
             # Update progress
             if self.gui_ref and hasattr(self.gui_ref, 'progressbar2'):
@@ -2258,6 +3172,464 @@ class Photometry:
                 logger.warning("Batch SIMBAD query failed and batch too large for individual fallback")
                 return simbad_matches
     
+    def _simbad_xmatch(self, sky_coords, radius_arcsec=5.0):
+        """
+        Perform efficient SIMBAD X-Match using single bulk TAP upload.
+        Much faster than individual queries - replaces the slow individual SIMBAD loop.
+        
+        Args:
+            sky_coords: List of SkyCoord objects
+            radius_arcsec: Search radius in arcseconds
+            
+        Returns:
+            List of SIMBAD match dictionaries with X-Match field names, one per input coordinate
+        """
+        try:
+            if not sky_coords or len(sky_coords) == 0:
+                return []
+                
+            logger.info(f"Starting SIMBAD bulk X-Match for {len(sky_coords)} sources (radius={radius_arcsec} arcsec)")
+            
+            # Use only the TAP-upload bulk X-Match approach
+            matches = self._simbad_xmatch_bulk(sky_coords, radius_arcsec)
+            
+            successful_matches = len([m for m in matches if m.get('simbad_main_id')])
+            logger.info(f"SIMBAD X-Match completed: {successful_matches}/{len(sky_coords)} sources matched")
+            return matches
+            
+        except Exception as e:
+            logger.error(f"SIMBAD X-Match failed: {e}")
+            logger.info("Falling back to empty results")
+            return self._create_empty_simbad_matches(len(sky_coords))
+    
+    def _simbad_xmatch_bulk(self, sky_coords, radius_arcsec=5.0):
+        """
+        Perform true SIMBAD X-Match using single bulk TAP upload.
+        
+        Args:
+            sky_coords: List of SkyCoord objects
+            radius_arcsec: Search radius in arcseconds
+            
+        Returns:
+            List of SIMBAD match dictionaries with X-Match field names
+        """
+        try:
+            from astropy.table import Table
+            import numpy as np
+            
+            # Create astropy table directly with proper format (no CSV file needed)
+            coords_table = Table()
+            coords_table['source_id'] = np.arange(len(sky_coords), dtype=int)
+            # Round coordinates to avoid decimal parsing issues in SIMBAD TAP
+            coords_table['ra'] = np.array([round(coord.ra.degree, 6) for coord in sky_coords], dtype=float)  # Ensure degrees (0-360)
+            coords_table['dec'] = np.array([round(coord.dec.degree, 6) for coord in sky_coords], dtype=float)  # Ensure degrees (-90 to +90)
+            
+            # Set column metadata to help TAP understand the format
+            coords_table['ra'].unit = 'deg'
+            coords_table['dec'].unit = 'deg'
+            
+            logger.info(f"Created upload table with {len(coords_table)} coordinates in degrees")
+            
+            # Build lean ADQL X-Match query with correct field names and aliases
+            # Use radius in arcseconds and convert with division in ADQL to avoid decimal parsing issues
+            radius_arcsec_int = int(radius_arcsec)
+            radius_deg = float(radius_arcsec) / 3600.0  # e.g., 5" -> 0.0013888889
+
+            xmatch_query = (
+                "SELECT "
+                "  u.source_id AS source_id, "
+                "  u.ra  AS input_ra, "
+                "  u.dec AS input_dec, "
+                "  b.main_id AS simbad_main_id, "
+                "  b.ra, b.dec, b.otype, b.sp_type, b.rvz_radvel, "
+                "  b.pmra, b.pmdec, b.plx_value AS parallax, "
+                "  DISTANCE(POINT('ICRS', u.ra, u.dec), POINT('ICRS', b.ra, b.dec)) AS distance_result "
+                "FROM TAP_UPLOAD.\"upload_table\" AS u "
+                "JOIN basic AS b "
+                "  ON 1 = CONTAINS(POINT('ICRS', b.ra, b.dec), "
+                f"                  CIRCLE('ICRS', u.ra, u.dec, {radius_deg:.8f})) "
+                "ORDER BY source_id ASC, distance_result ASC"
+            )
+            
+            logger.debug(f"ADQL query: {xmatch_query.strip()}")
+            logger.debug(f"Upload table columns: {coords_table.colnames}")
+            
+            # Use astroquery SIMBAD TAP upload API - pass table as keyword argument
+            from astroquery.simbad import Simbad
+            results = Simbad.query_tap(xmatch_query, upload_table=coords_table)
+            
+            if results is None or len(results) == 0:
+                logger.info("No X-Match results returned from TAP upload")
+                return self._create_empty_simbad_matches(len(sky_coords))
+            
+            logger.info(f"TAP X-Match returned {len(results)} matches")
+            
+            # Process X-Match results and merge with input coordinates
+            return self._process_tap_xmatch_results(results, len(sky_coords))
+            
+        except Exception as e:
+            logger.error(f"SIMBAD TAP X-Match failed: {e}")
+            logger.info("Falling back to single cone search + local matching")
+            return self._simbad_cone_search_fallback(sky_coords, radius_arcsec)
+    
+    def _simbad_cone_search_fallback(self, sky_coords, radius_arcsec=5.0):
+        """
+        Fallback: Single SIMBAD cone search for whole field + local nearest-neighbor matching.
+        No uploads, no MIME, no batching, no ADQL - just one query + astropy matching.
+        
+        Args:
+            sky_coords: List of SkyCoord objects
+            radius_arcsec: Search radius in arcseconds
+            
+        Returns:
+            List of SIMBAD match dictionaries
+        """
+        try:
+            import numpy as np
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            
+            logger.info(f"SIMBAD cone search fallback for {len(sky_coords)} sources")
+            
+            # Smart partitioning: if sources are too spread out, query each individually
+            # This is better than a single huge cone that returns irrelevant objects
+            ras = [coord.ra.degree for coord in sky_coords]
+            decs = [coord.dec.degree for coord in sky_coords]
+            
+            ra_span = max(ras) - min(ras)
+            dec_span = max(decs) - min(decs)
+            field_span = max(ra_span, dec_span)
+            
+            logger.debug(f"Field span: RA={ra_span:.3f}°, Dec={dec_span:.3f}°, max={field_span:.3f}°")
+            
+            # If field is too large (>5°), fall back to individual queries
+            if field_span > 5.0:
+                logger.info(f"Field span {field_span:.1f}° too large for cone search, using individual queries")
+                return self._create_empty_simbad_matches(len(sky_coords))
+            
+            # For reasonably sized fields, do individual small cone searches
+            all_simbad_objects = []
+            for i, coord in enumerate(sky_coords):
+                search_radius_deg = (radius_arcsec + 60) / 3600.0  # Add 60" padding for nearby objects
+                
+                individual_query = f"""
+                SELECT main_id, ra, dec, otype, sp_type, rvz_radvel, pmra, pmdec, plx_value
+                FROM basic
+                WHERE 1=CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {coord.ra.degree}, {coord.dec.degree}, {search_radius_deg}))
+                """
+                
+                try:
+                    job = self.simbad_tap.launch_job(individual_query)
+                    objects = job.get_results()
+                    if objects is not None and len(objects) > 0:
+                        all_simbad_objects.extend(objects)
+                        logger.debug(f"Source {i+1}: found {len(objects)} SIMBAD objects nearby")
+                except Exception as e:
+                    logger.debug(f"Source {i+1}: individual cone query failed: {e}")
+            
+            # Remove duplicates by main_id
+            seen_ids = set()
+            unique_objects = []
+            for obj in all_simbad_objects:
+                if obj['main_id'] not in seen_ids:
+                    seen_ids.add(obj['main_id'])
+                    unique_objects.append(obj)
+            
+            simbad_objects = unique_objects
+            logger.info(f"Retrieved {len(simbad_objects)} unique SIMBAD objects from {len(sky_coords)} individual cone searches")
+            
+            if simbad_objects is None or len(simbad_objects) == 0:
+                logger.info("No SIMBAD objects found in field")
+                return self._create_empty_simbad_matches(len(sky_coords))
+            
+            logger.info(f"Retrieved {len(simbad_objects)} SIMBAD objects from field")
+            
+            # Debug: Show some sample coordinates 
+            logger.debug(f"Sample input coords: {[(c.ra.degree, c.dec.degree) for c in sky_coords[:3]]}")
+            logger.debug(f"Sample SIMBAD coords: {[(obj['ra'], obj['dec']) for obj in simbad_objects[:3]]}")
+            
+            # Local nearest-neighbor matching using astropy
+            matches = self._local_nearest_neighbor_match(sky_coords, simbad_objects, radius_arcsec)
+            
+            successful_matches = len([m for m in matches if m['simbad_main_id']])
+            logger.info(f"Local matching: {successful_matches}/{len(sky_coords)} sources matched")
+            
+            return matches
+            
+        except Exception as e:
+            logger.error(f"SIMBAD cone search fallback failed: {e}")
+            return self._create_empty_simbad_matches(len(sky_coords))
+    
+    def _local_nearest_neighbor_match(self, sky_coords, simbad_objects, radius_arcsec):
+        """
+        Perform local nearest-neighbor matching between input coordinates and SIMBAD objects.
+        Pure astropy coordinate matching - no server-side processing.
+        """
+        try:
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+            import numpy as np
+            
+            # Convert SIMBAD objects to SkyCoord for efficient matching
+            simbad_coords = SkyCoord(
+                ra=[float(obj['ra']) for obj in simbad_objects] * u.deg,
+                dec=[float(obj['dec']) for obj in simbad_objects] * u.deg,
+                frame='icrs'
+            )
+            
+            matches = []
+            radius = radius_arcsec * u.arcsec
+            
+            # For each input coordinate, find nearest SIMBAD object within radius
+            for i, input_coord in enumerate(sky_coords):
+                # Calculate separations to all SIMBAD objects
+                separations = input_coord.separation(simbad_coords)
+                
+                # Debug: Show minimum separation for first few sources
+                if i < 3:
+                    min_sep = np.min(separations)
+                    logger.debug(f"Source {i+1} at ({input_coord.ra.degree:.3f}, {input_coord.dec.degree:.3f}): min_sep={min_sep.to(u.arcsec):.1f} vs radius={radius:.1f}")
+                
+                # Find objects within search radius
+                within_radius = separations <= radius
+                
+                if np.any(within_radius):
+                    # Find the closest match
+                    closest_idx = np.argmin(separations)
+                    closest_separation = separations[closest_idx]
+                    
+                    if closest_separation <= radius:
+                        # Format the match
+                        simbad_obj = simbad_objects[closest_idx]
+                        match_dict = {
+                            'simbad_main_id': str(simbad_obj['main_id']) if simbad_obj['main_id'] is not None else '',
+                            'ra': float(simbad_obj['ra']) if simbad_obj['ra'] is not None else np.nan,
+                            'dec': float(simbad_obj['dec']) if simbad_obj['dec'] is not None else np.nan,
+                            'otype': str(simbad_obj['otype']) if simbad_obj['otype'] is not None else '',
+                            'sp_type': str(simbad_obj['sp_type']) if simbad_obj['sp_type'] is not None else '',
+                            'rvz_radvel': float(simbad_obj['rvz_radvel']) if simbad_obj['rvz_radvel'] is not None else np.nan,
+                            'pmra': float(simbad_obj['pmra']) if simbad_obj['pmra'] is not None else np.nan,
+                            'pmdec': float(simbad_obj['pmdec']) if simbad_obj['pmdec'] is not None else np.nan,
+                            'parallax': float(simbad_obj['plx_value']) if simbad_obj['plx_value'] is not None else np.nan,
+                            'separation_arcsec': closest_separation.arcsec,
+                            'distance_pc': (1000.0 / float(simbad_obj['plx_value'])) if (simbad_obj['plx_value'] is not None and float(simbad_obj['plx_value']) > 0) else np.nan
+                        }
+                        matches.append(match_dict)
+                    else:
+                        matches.append(self._create_empty_simbad_match())
+                else:
+                    matches.append(self._create_empty_simbad_match())
+            
+            return matches
+            
+        except Exception as e:
+            logger.error(f"Local nearest-neighbor matching failed: {e}")
+            return self._create_empty_simbad_matches(len(sky_coords))
+    
+    # Removed old per-object processing functions - using only TAP bulk upload
+    
+    # Removed old astroquery formatting function - using only TAP bulk upload
+    
+    # Removed legacy CSV uploader - using direct astropy Table upload
+    
+    def _process_tap_xmatch_results(self, results, num_sources):
+        """Process TAP X-Match results and create match list with one entry per source."""
+        # Initialize empty matches for all sources
+        matches = self._create_empty_simbad_matches(num_sources)
+        
+        # Group results by source_id and take the closest match (results are already sorted by distance_result)
+        for row in results:
+            source_id = int(row['source_id'])
+            
+            if source_id < len(matches):
+                # Convert TAP X-Match fields with standardized units
+                distance_result = float(row['distance_result']) if row['distance_result'] is not None else np.nan
+                separation_arcsec = distance_result * 3600.0 if not np.isnan(distance_result) else np.nan
+                
+                match_dict = {
+                    'simbad_main_id': str(row['simbad_main_id']) if row['simbad_main_id'] is not None else '',
+                    'ra': float(row['ra']) if row['ra'] is not None else np.nan,
+                    'dec': float(row['dec']) if row['dec'] is not None else np.nan,
+                    'otype': str(row['otype']) if row['otype'] is not None else '',
+                    'sp_type': str(row['sp_type']) if row['sp_type'] is not None else '',
+                    'rvz_radvel': float(row['rvz_radvel']) if row['rvz_radvel'] is not None else np.nan,
+                    'pmra': float(row['pmra']) if row['pmra'] is not None else np.nan,
+                    'pmdec': float(row['pmdec']) if row['pmdec'] is not None else np.nan,
+                    'parallax': float(row['parallax']) if row['parallax'] is not None else np.nan,
+                    'separation_arcsec': separation_arcsec,
+                    'distance_pc': (1000.0 / float(row['parallax'])) if (row['parallax'] is not None and float(row['parallax']) > 0) else np.nan
+                }
+                
+                # Only update if this is the first match or closer than existing match
+                if not matches[source_id]['simbad_main_id'] or separation_arcsec < matches[source_id].get('separation_arcsec', float('inf')):
+                    matches[source_id] = match_dict
+        
+        return matches
+    
+    # Removed fallback function - using only TAP bulk upload
+    
+    def _create_empty_simbad_match(self):
+        """Create an empty SIMBAD match dictionary with standardized field names."""
+        return {
+            'simbad_main_id': '',
+            'ra': np.nan,
+            'dec': np.nan,
+            'otype': '',
+            'sp_type': '',
+            'rvz_radvel': np.nan,
+            'pmra': np.nan,
+            'pmdec': np.nan,
+            'parallax': np.nan,
+            'separation_arcsec': np.nan,
+            'distance_pc': np.nan
+        }
+    
+    def _simbad_xmatch_batch(self, batch_coords, radius_arcsec, start_index):
+        """
+        Process a single batch of coordinates using efficient area query + filtering.
+        """
+        if not batch_coords:
+            return []
+        
+        # Calculate area boundaries for the batch
+        ras = [coord.ra.degree for coord in batch_coords]
+        decs = [coord.dec.degree for coord in batch_coords]
+        
+        ra_min, ra_max = min(ras) - 0.02, max(ras) + 0.02  # Add padding
+        dec_min, dec_max = min(decs) - 0.02, max(decs) + 0.02
+        
+        
+        # Query SIMBAD for all objects in the region (simplified schema)
+        region_query = f"""
+        SELECT b.main_id, b.ra, b.dec, b.pmra, b.pmdec, b.plx_value as parallax,
+               otypes.otype as object_type
+        FROM basic b
+        LEFT JOIN otypes ON b.oid = otypes.oidref
+        WHERE b.ra BETWEEN {ra_min} AND {ra_max}
+          AND b.dec BETWEEN {dec_min} AND {dec_max}
+        """
+        
+        job = self.simbad_tap.launch_job(region_query)
+        results = job.get_results()
+        
+        if results is None or len(results) == 0:
+            logger.debug(f"No SIMBAD objects found in region RA: {ra_min:.3f}-{ra_max:.3f}, Dec: {dec_min:.3f}-{dec_max:.3f}")
+            return self._create_empty_simbad_matches(len(batch_coords))
+        
+        
+        # Match each coordinate with the nearest SIMBAD object within radius
+        batch_matches = []
+        radius_deg = radius_arcsec / 3600.0
+        
+        for i, coord in enumerate(batch_coords):
+            best_match = None
+            best_separation = float('inf')
+            matches_within_radius = 0
+            
+            for row in results:
+                simbad_ra = float(row['ra'])
+                simbad_dec = float(row['dec'])
+                
+                # Calculate proper spherical separation accounting for coordinate system
+                # Use astropy SkyCoord for accurate separation calculation
+                simbad_coord = SkyCoord(ra=simbad_ra*u.deg, dec=simbad_dec*u.deg, frame='icrs')
+                separation_angle = coord.separation(simbad_coord)
+                separation = separation_angle.degree
+                
+                if separation <= radius_deg:
+                    matches_within_radius += 1
+                    if separation < best_separation:
+                        best_match = row
+                        best_separation = separation
+            
+            if best_match is not None:
+                match_dict = self._format_simbad_match_from_row(best_match, best_separation * 3600)
+                batch_matches.append(match_dict)
+            else:
+                batch_matches.append(self._create_empty_simbad_match())
+        
+        return batch_matches
+    
+    def _format_simbad_match_from_row(self, row, separation_arcsec):
+        """Format a SIMBAD result row into match dictionary format."""
+        try:
+            return {
+                'main_id': str(row['main_id']) if row['main_id'] is not None else '',
+                'ra': float(row['ra']) if row['ra'] is not None else np.nan,
+                'dec': float(row['dec']) if row['dec'] is not None else np.nan,
+                'object_type': str(row['object_type']) if row['object_type'] is not None else '',
+                'v_mag': np.nan,  # Magnitude data not included in simplified query
+                'b_mag': np.nan,  # Magnitude data not included in simplified query
+                'pmra': float(row['pmra']) if row['pmra'] is not None else np.nan,
+                'pmdec': float(row['pmdec']) if row['pmdec'] is not None else np.nan,
+                'parallax': float(row['parallax']) if row['parallax'] is not None else np.nan,
+                'separation_arcsec': float(separation_arcsec),
+                'distance_pc': (1000.0 / float(row['parallax'])) if (row['parallax'] is not None and float(row['parallax']) > 0) else np.nan
+            }
+        except Exception as e:
+            logger.warning(f"Error formatting SIMBAD match: {e}")
+            return self._create_empty_simbad_match()
+    
+    def _process_xmatch_results(self, results, num_sources):
+        """
+        Process X-Match results and create a match list with one entry per source.
+        Takes the best match (closest) for each source.
+        """
+        # Initialize empty matches for all sources
+        simbad_matches = self._create_empty_simbad_matches(num_sources)
+        
+        # Group results by source_id and take the best match for each
+        current_source_id = None
+        best_match = None
+        
+        for row in results:
+            source_id = int(row['source_id'])
+            separation = float(row['separation_arcsec'])
+            
+            # If this is a new source or a better match for current source
+            if source_id != current_source_id:
+                # Save previous best match if we had one
+                if current_source_id is not None and best_match is not None:
+                    simbad_matches[current_source_id] = self._format_simbad_match(best_match)
+                
+                # Start new source
+                current_source_id = source_id
+                best_match = row
+            else:
+                # Same source - check if this is a better match
+                if separation < float(best_match['separation_arcsec']):
+                    best_match = row
+        
+        # Don't forget the last match
+        if current_source_id is not None and best_match is not None:
+            simbad_matches[current_source_id] = self._format_simbad_match(best_match)
+        
+        return simbad_matches
+    
+    def _format_simbad_match(self, row):
+        """Format a SIMBAD X-Match result row into the expected match dictionary format."""
+        try:
+            return {
+                'main_id': str(row['main_id']) if row['main_id'] is not None else '',
+                'ra': float(row['simbad_ra']) if row['simbad_ra'] is not None else np.nan,
+                'dec': float(row['simbad_dec']) if row['simbad_dec'] is not None else np.nan,
+                'object_type': str(row['object_type']) if row['object_type'] is not None else '',
+                'v_mag': float(row['v_mag']) if row['v_mag'] is not None else np.nan,
+                'b_mag': float(row['b_mag']) if row['b_mag'] is not None else np.nan,
+                'pmra': float(row['pmra']) if row['pmra'] is not None else np.nan,
+                'pmdec': float(row['pmdec']) if row['pmdec'] is not None else np.nan,
+                'parallax': float(row['parallax']) if row['parallax'] is not None else np.nan,
+                'separation_arcsec': float(row['separation_arcsec']),
+                'distance_pc': (1000.0 / float(row['parallax'])) if (row['parallax'] is not None and float(row['parallax']) > 0) else np.nan
+            }
+        except Exception as e:
+            logger.warning(f"Error formatting SIMBAD match: {e}")
+            return self._create_empty_simbad_match()
+    
+    def _create_empty_simbad_matches(self, count):
+        """Create a list of empty SIMBAD match dictionaries."""
+        return [self._create_empty_simbad_match() for _ in range(count)]
+    
     def _query_simbad_fallback(self, sky_coords, radius_arcsec=5.0):
         """
         Fallback to individual SIMBAD queries when batch query fails.
@@ -2280,6 +3652,114 @@ class Photometry:
         logger.info(f"Fallback SIMBAD queries completed for {len(sky_coords)} sources")
         return simbad_matches
     
+    def _query_gaia_optimized(self, detected_sources_coords, field_radius_deg=0.25):
+        """
+        Optimized Gaia query: Single async CIRCLE query with RUWE/magnitude filtering.
+        Replaces 189 tiny cone searches with one field query + local matching.
+        
+        Args:
+            detected_sources_coords: List of SkyCoord objects for detected sources
+            field_radius_deg: Field radius in degrees for single query
+            
+        Returns:
+            dict: Mapping from source index to Gaia data, or None if query fails
+        """
+        try:
+            if not detected_sources_coords:
+                return {}
+            
+            logger.info(f"Starting optimized Gaia query for {len(detected_sources_coords)} sources")
+            
+            # Calculate field center from detected sources
+            ras = [coord.ra.degree for coord in detected_sources_coords]
+            decs = [coord.dec.degree for coord in detected_sources_coords]
+            
+            center_ra = np.mean(ras)
+            center_dec = np.mean(decs)
+            
+            # Adaptive radius based on source distribution
+            ra_span = max(ras) - min(ras)
+            dec_span = max(decs) - min(decs)
+            auto_radius = max(ra_span, dec_span) / 2.0 + 0.05  # Add 0.05° padding
+            query_radius = max(field_radius_deg, auto_radius)
+            
+            logger.info(f"Field center: ({center_ra:.4f}°, {center_dec:.4f}°), radius: {query_radius:.4f}°")
+            
+            # Single optimized ADQL query with RUWE and magnitude filtering
+            query = f"""
+            SELECT 
+                source_id, ra, dec, 
+                phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag,
+                bp_rp, parallax, pmra, pmdec, ruwe,
+                DISTANCE(POINT('ICRS', ra, dec), POINT('ICRS', {center_ra}, {center_dec})) AS center_distance
+            FROM gaiadr3.gaia_source 
+            WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {center_ra}, {center_dec}, {query_radius})) = 1
+                AND phot_g_mean_mag < 19.0
+                AND phot_g_mean_mag IS NOT NULL
+                AND (ruwe IS NULL OR ruwe < 1.4)
+                AND (phot_bp_mean_mag IS NOT NULL AND phot_rp_mean_mag IS NOT NULL)
+                AND parallax_over_error > 3.0
+            ORDER BY phot_g_mean_mag ASC
+            """
+            
+            logger.debug(f"Optimized Gaia query: {query}")
+            
+            # Execute single async query
+            start_time = time.time()
+            job = Gaia.launch_job_async(query)
+            gaia_sources = job.get_results()
+            query_time = time.time() - start_time
+            
+            if gaia_sources is None or len(gaia_sources) == 0:
+                logger.warning("No Gaia sources returned from optimized query")
+                return {}
+            
+            logger.info(f"Optimized Gaia query completed in {query_time:.2f}s: {len(gaia_sources)} sources")
+            
+            # Convert Gaia results to SkyCoord for efficient matching
+            gaia_coords = SkyCoord(
+                ra=gaia_sources['ra'],
+                dec=gaia_sources['dec'],
+                unit='deg'
+            )
+            
+            # Perform local nearest-neighbor matching
+            matches = {}
+            match_radius = 3.0 * u.arcsec  # 3 arcsec matching radius
+            
+            start_match_time = time.time()
+            for i, source_coord in enumerate(detected_sources_coords):
+                # Find closest Gaia source
+                separations = source_coord.separation(gaia_coords)
+                min_sep_idx = separations.argmin()
+                min_separation = separations[min_sep_idx]
+                
+                if min_separation <= match_radius:
+                    gaia_row = gaia_sources[min_sep_idx]
+                    matches[i] = {
+                        'gaia_source_id': str(gaia_row['source_id']),
+                        'gaia_ra': float(gaia_row['ra']),
+                        'gaia_dec': float(gaia_row['dec']),
+                        'phot_g_mean_mag': float(gaia_row['phot_g_mean_mag']) if gaia_row['phot_g_mean_mag'] is not np.ma.masked else np.nan,
+                        'phot_bp_mean_mag': float(gaia_row['phot_bp_mean_mag']) if gaia_row['phot_bp_mean_mag'] is not np.ma.masked else np.nan,
+                        'phot_rp_mean_mag': float(gaia_row['phot_rp_mean_mag']) if gaia_row['phot_rp_mean_mag'] is not np.ma.masked else np.nan,
+                        'bp_rp': float(gaia_row['bp_rp']) if gaia_row['bp_rp'] is not np.ma.masked else np.nan,
+                        'parallax': float(gaia_row['parallax']) if gaia_row['parallax'] is not np.ma.masked else np.nan,
+                        'pmra': float(gaia_row['pmra']) if gaia_row['pmra'] is not np.ma.masked else np.nan,
+                        'pmdec': float(gaia_row['pmdec']) if gaia_row['pmdec'] is not np.ma.masked else np.nan,
+                        'ruwe': float(gaia_row['ruwe']) if gaia_row['ruwe'] is not np.ma.masked else np.nan,
+                        'match_distance_arcsec': float(min_separation.arcsec)
+                    }
+            
+            match_time = time.time() - start_match_time
+            logger.info(f"Local matching completed in {match_time:.2f}s: {len(matches)}/{len(detected_sources_coords)} matched")
+            
+            return matches
+            
+        except Exception as e:
+            logger.error(f"Optimized Gaia query failed: {e}")
+            return {}
+
     def _query_gaia_field(self, center_ra, center_dec, radius_deg):
         """Query Gaia DR3 for sources in the field with overload protection and tiling."""
         try:
@@ -2316,15 +3796,18 @@ class Photometry:
                 
                 logger.debug(f"Gaia query attempt {attempt + 1}: radius={retry_radius:.4f}°, mag_limit={retry_mag_limit:.1f}, max_rows={retry_max_rows}")
                 
-                # ADQL query with limits
+                # Optimized ADQL query with RUWE filter, magnitude cuts, and minimal columns
                 query = f"""
                 SELECT TOP {retry_max_rows}
-                    source_id, ra, dec, phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag, 
-                    bp_rp, parallax, pmra, pmdec
+                    source_id, ra, dec, 
+                    phot_g_mean_mag, phot_bp_mean_mag, phot_rp_mean_mag,
+                    bp_rp, parallax, pmra, pmdec, ruwe
                 FROM gaiadr3.gaia_source 
                 WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', {center_ra}, {center_dec}, {retry_radius})) = 1
                     AND phot_g_mean_mag < {retry_mag_limit}
                     AND phot_g_mean_mag IS NOT NULL
+                    AND (ruwe IS NULL OR ruwe < 1.4)
+                    AND (phot_bp_mean_mag IS NOT NULL AND phot_rp_mean_mag IS NOT NULL)
                 ORDER BY phot_g_mean_mag ASC
                 """
                 

@@ -3,8 +3,16 @@
     "allow": [
       "Bash(pip install:*)",
       "Bash(python test:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(timeout 60 python test_simbad_xmatch.py)",
+      "Bash(timeout 30 python test_simbad_xmatch.py)",
+      "Bash(timeout 120 python:*)",
+      "Bash(timeout 300 python test_simbad_xmatch.py)",
+      "WebFetch(domain:astroquery.readthedocs.io)",
+      "Bash(cat:*)",
+      "Bash(wsl:*)"
     ],
-    "deny": []
+    "deny": [],
+    "defaultMode": "acceptEdits"
   }
 }
